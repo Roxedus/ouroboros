@@ -1,0 +1,174 @@
+name: Publish Changes
+on:
+  push:
+    paths:
+      - "Dockerfile*"
+      - ouroboros
+      - pyouroboros/*
+      - .github/workflows/publish.yml
+    branches:
+      - master
+      #- develop
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    if: ! contains(toJSON(github.event.commits.*.message), '[ci skip]')
+    outputs:
+      py_ver: ${{ steps.GetPython.outputs.py_ver }}
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Get python version
+        id: GetPython
+        run: |
+          echo "::set-output name=py_ver::$(grep -Po 'FROM amd64/python:\K[0-9]{1,2}.[0-9]{1,2}.[0-9]{1,2}' Dockerfile)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ steps.GetPython.outputs.py_ver }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U flake8
+
+      - name: Run Flake
+        run: flake8 --max-line-length 120 ouroboros *.py pyouroboros/*.py
+
+  bump-and-push:
+    needs: test
+    runs-on: ubuntu-20.04
+    outputs:
+      branch: ${{ steps.vars.outputs.branch }}
+      repo: ${{ steps.vars.outputs.repo }}
+      tag: ${{ steps.vars.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Create VARS
+        env:
+          _repo: ${{github.repository}}
+          _ref: ${{github.ref}}
+        id: vars
+        run: |
+          echo "::set-output name=branch::$(echo ${_ref} | cut -d/ -f3,4 | sed 's!/!-!' | tr '[:upper:]' '[:lower:]')"
+          echo "::set-output name=old_tag::$(grep -i version pyouroboros/__init__.py | cut -d \  -f3 | tr -d \")"
+          echo "::set-output name=repo::$(echo ${_repo} | tr '[:upper:]' '[:lower:]')"
+          if git diff-tree --no-commit-id --name-only --quiet -r $GITHUB_SHA -- . ':requirements.txt'; then
+            version=$(grep -i version pyouroboros/__init__.py | cut -d \  -f3 | tr -d \")
+            a=(${version//./ })
+            ((a[2]++))
+            version=$(echo "${a[0]}.${a[1]}.${a[2]}")
+            echo ${version}
+            echo "::set-output name=branch::${version}"
+            echo "::set-output name=tag::true"
+          fi
+
+      - name: Set tag
+        if: steps.vars.outputs.tag == 'true'
+        shell: bash
+        run: |
+          sed -i "s/${{ steps.vars.outputs.old_tag }}/${{ steps.vars.outputs.branch }}/g" pyouroboros/__init__.py
+
+      - name: Push changed files, and tags
+        if: steps.vars.outputs.tag == 'true'
+        uses: EndBug/add-and-commit@v4
+        with:
+          add: pyouroboros/__init__.py
+          author_name: GHActions
+          message: Bump Version
+          tag: ${{ steps.vars.outputs.branch }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-docker_pypi:
+    needs: bump-and-push
+    runs-on: ubuntu-20.04
+
+    env:
+      DOCKER_CLI_EXPERIMENTAL: enabled
+      PLATFORM_1: amd64
+      PLATFORM_2: arm
+      PLATFORM_3: arm64
+      BRANCH: needs.bump-and-push.outputs.branch
+      REPO: needs.bump-and-push.outputs.repo
+
+    steps:
+      - name: Set up buildkit for multiarch builds
+        run: |
+          docker run --privileged linuxkit/binfmt:v0.8
+
+      - name: Login to registry
+        if: github.event_name != 'pull_request' && contains(github.ref, 'actions') != 'true'
+        env:
+          DOCKER_USERNAME: dirtycajunrice
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_HUB_PASSWORD }}
+        run: echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin
+
+      - name: Build and push amd64
+        env:
+          DOCKERFILE_LOCATION: Dockerfile
+        run: |
+          docker build --pull \
+            --cache-from ${REPO}:${BRANCH}-${PLATFORM_1} \
+            --tag ${REPO}:${BRANCH}-${PLATFORM_1} \
+            --file=${DOCKERFILE_LOCATION} \
+            --platform=${PLATFORM_1} .
+          docker push ${REPO}:${BRANCH}-${PLATFORM_1}
+
+      - name: Build and push arm
+        env:
+          DOCKERFILE_LOCATION: Dockerfile.arm
+        run: |
+          docker build --pull \
+            --cache-from ${REPO}:${BRANCH}-${PLATFORM_2} \
+            --tag ${REPO}:${BRANCH}-${PLATFORM_2} \
+            --file ${DOCKERFILE_LOCATION} \
+            --platform ${PLATFORM_2} .
+          docker push ${REPO}:${BRANCH}-${PLATFORM_2}
+
+      - name: Build and push arm64
+        env:
+          DOCKERFILE_LOCATION: Dockerfile.arm64
+        run: |
+          docker build --pull \
+            --cache-from ${REPO}:${BRANCH}-${PLATFORM_3} \
+            --tag ${REPO}:${BRANCH}-${PLATFORM_3} \
+            --file ${DOCKERFILE_LOCATION} \
+            --platform ${PLATFORM_3} .
+          docker push ${REPO}:${BRANCH}-${PLATFORM_3}
+
+      - name: Create :latest manifest
+        if: needs.bump-and-push.outputs.tag == 'true'
+        run: |
+          docker manifest create ${REPO}:latest \
+            ${REPO}:${BRANCH}-${PLATFORM_1} \
+            ${REPO}:${BRANCH}-${PLATFORM_2} \
+            ${REPO}:${BRANCH}-${PLATFORM_3}
+          docker manifest push ${REPO}:latest
+
+      - name: Create branch manifest
+        run: |
+          docker manifest create ${REPO}:${BRANCH} \
+            ${REPO}:${BRANCH}-${PLATFORM_1} \
+            ${REPO}:${BRANCH}-${PLATFORM_2} \
+            ${REPO}:${BRANCH}-${PLATFORM_3}
+          docker manifest push ${REPO}:${BRANCH}
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ needs.test.outputs.py_ver }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U twine
+
+      - name: Publish to pypi
+        if: needs.bump-and-push.outputs.tag == 'true'
+        run: python setup.py sdist && twine upload --skip-existing -u ${{ secrets.PYPI_CREDS_USR }} -p ${{ secrets.PYPI_CREDS_PSW }} dist/*
