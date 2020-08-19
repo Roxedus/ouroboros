@@ -55,7 +55,7 @@ jobs:
           _ref: ${{github.ref}}
         id: vars
         run: |
-          echo "::set-output name=branch::$(echo ${_ref} | cut -d/ -f3,4 | sed 's!/!-!' | tr '[:upper:]' '[:lower:]')"
+          echo "::set-output name=branch::$(grep -i version pyouroboros/__init__.py | cut -d \  -f3 | tr -d \")"
           echo "::set-output name=old_tag::$(grep -i version pyouroboros/__init__.py | cut -d \  -f3 | tr -d \")"
           echo "::set-output name=repo::$(echo ${_repo} | tr '[:upper:]' '[:lower:]')"
           if git diff-tree --no-commit-id --name-only --quiet -r $GITHUB_SHA -- . ':requirements.txt'; then
